@@ -1,6 +1,6 @@
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
-const { Participant, Answer, Question, QuestionLeaderboard, GameLeaderboard, GameSession } = require('../models');
+const { Participant, Answer, Question, QuestionLeaderboard, GameLeaderboard, GameSession, sequelize, Sequelize } = require('../models');
 const { generateLeaderboardForQuestion } = require('../controllers/leaderboardController');
 const { generateGameLeaderboard } = require('../controllers/gameLeaderboardController');
 
@@ -291,6 +291,84 @@ exports.initSocket = (server) => {
             }
         });
 
+        // Audience viewer joins the main session room for broadcasts
+        socket.on('audience_join', () => {
+            try {
+                socket.join(SESSION_ROOM);
+                console.log(`[AUDIENCE] ${socket.id} joined ${SESSION_ROOM}`);
+            } catch (e) {
+                console.error('Error in audience_join:', e);
+            }
+        });
+
+        // Helper used by both audience question handlers
+        const ackCurrentQuestionForAudience = async (ack) => {
+            try {
+                if (!currentSession.currentQuestionId) {
+                    if (typeof ack === 'function') return ack({ question: null, status: currentSession.status });
+                    return;
+                }
+                const question = await Question.findByPk(currentSession.currentQuestionId);
+                if (typeof ack === 'function') {
+                    return ack({ question: question || null, status: currentSession.status });
+                }
+            } catch (e) {
+                console.error('Error in audience_get_question/get_current_question:', e);
+                if (typeof ack === 'function') return ack({ question: null, status: currentSession.status });
+            }
+        };
+
+        // Primary audience query
+        socket.on('audience_get_question', async (_payload, ack) => {
+            await ackCurrentQuestionForAudience(ack);
+        });
+
+        // Back-compat alias used by some clients
+        socket.on('get_current_question', async (_payload, ack) => {
+            await ackCurrentQuestionForAudience(ack);
+        });
+
+        // Helper used by both audience counts handlers
+        const ackCurrentCountsForAudience = async (ack) => {
+            const empty = { A: 0, B: 0, C: 0, D: 0 };
+            try {
+                const qid = currentSession.currentQuestionId;
+                if (!qid) {
+                    if (typeof ack === 'function') return ack({ counts: empty, status: currentSession.status });
+                    return;
+                }
+                // Aggregate counts by selectedAnswer, counting distinct participants for safety
+                const rows = await Answer.findAll({
+                    where: { gameSessionId: GAME_SESSION_ID, questionId: qid },
+                    attributes: [
+                        'selectedAnswer',
+                        [sequelize.fn('COUNT', sequelize.fn('DISTINCT', sequelize.col('participantId'))), 'count']
+                    ],
+                    group: ['selectedAnswer']
+                });
+                const counts = { ...empty };
+                for (const r of rows) {
+                    const key = r.get('selectedAnswer');
+                    const cnt = Number(r.get('count') || 0);
+                    if (key && counts.hasOwnProperty(key)) counts[key] = cnt;
+                }
+                if (typeof ack === 'function') return ack({ counts, status: currentSession.status });
+            } catch (e) {
+                console.error('Error in audience_get_counts/get_current_counts:', e);
+                if (typeof ack === 'function') return ack({ counts: { A: 0, B: 0, C: 0, D: 0 }, status: currentSession.status });
+            }
+        };
+
+        // Primary audience counts query
+        socket.on('audience_get_counts', async (_payload, ack) => {
+            await ackCurrentCountsForAudience(ack);
+        });
+
+        // Back-compat alias used by some clients
+        socket.on('get_current_counts', async (_payload, ack) => {
+            await ackCurrentCountsForAudience(ack);
+        });
+
         // Honor admin_reconnect to hand control to the new admin socket id
         socket.on('admin_reconnect', () => {
             if (socket.data && socket.data.isAdmin) {
@@ -373,9 +451,10 @@ exports.initSocket = (server) => {
                 // Backwards-compatible emit
                 socket.emit('joined_success', { participant });
 
-                // Notify admin room with lobby update
+                // Notify rooms with lobby update (admin + audience)
                 const participants = await Participant.findAll({ where: { gameSessionId: GAME_SESSION_ID } });
                 io.to('admin_room').emit('lobby_update', { participants, count: participants.length });
+                io.to(SESSION_ROOM).emit('lobby_update', { participants, count: participants.length });
 
                 // ========== ENHANCED: Better session state recovery ==========
                 // If session is active AND there's a current question, send it to the player
@@ -571,6 +650,18 @@ exports.initSocket = (server) => {
                             gameSessionId: GAME_SESSION_ID,
                             updated: true,
                         });
+                        // Optional: also broadcast to audience room for live bars
+                        if (process.env.AUDIENCE_LIVE_BARS === 'true') {
+                            io.to(SESSION_ROOM).emit('participant_submitted', {
+                                participant: participantInfo, // optionally anonymize
+                                questionId,
+                                selectedAnswer,
+                                isCorrect,
+                                answeredAt: existing.answeredAt || new Date(),
+                                gameSessionId: GAME_SESSION_ID,
+                                updated: true,
+                            });
+                        }
                     } catch (e) {
                         console.error('Error emitting participant_submitted (updated) to admin:', e);
                     }
@@ -601,6 +692,17 @@ exports.initSocket = (server) => {
                         answeredAt: answer.answeredAt || new Date(),
                         gameSessionId: GAME_SESSION_ID,
                     });
+                    // Optional: also broadcast to audience room for live bars
+                    if (process.env.AUDIENCE_LIVE_BARS === 'true') {
+                        io.to(SESSION_ROOM).emit('participant_submitted', {
+                            participant: participantInfo, // optionally anonymize
+                            questionId,
+                            selectedAnswer,
+                            isCorrect,
+                            answeredAt: answer.answeredAt || new Date(),
+                            gameSessionId: GAME_SESSION_ID,
+                        });
+                    }
                 } catch (e) {
                     console.error('Error emitting participant_submitted to admin:', e);
                 }
@@ -663,7 +765,7 @@ exports.initSocket = (server) => {
         /* -------------------------------------------
            Disconnect
         ------------------------------------------- */
-        socket.on('disconnect', () => {
+        socket.on('disconnect', async () => {
             console.log(`🔴 Disconnected: ${socket.id}`);
             if (socket.data?.isAdmin && activeAdminSocketId === socket.id) {
                 console.log('[INFO] active admin disconnected, clearing activeAdminSocketId');
@@ -674,6 +776,16 @@ exports.initSocket = (server) => {
                     console.log(`✅ admin_presence broadcast: present=false socket=${socket.id} ts=${ts}`);
                 } catch (e) {
                     console.error('Error broadcasting admin_presence false:', e);
+                }
+            }
+            // If a participant disconnected, refresh lobby counts for all
+            if (socket.data?.participantId) {
+                try {
+                    const participants = await Participant.findAll({ where: { gameSessionId: GAME_SESSION_ID } });
+                    io.to('admin_room').emit('lobby_update', { participants, count: participants.length });
+                    io.to(SESSION_ROOM).emit('lobby_update', { participants, count: participants.length });
+                } catch (e) {
+                    console.error('Error emitting lobby_update on participant disconnect:', e);
                 }
             }
         });
@@ -696,6 +808,9 @@ exports.clearLiveData = async (gameSessionId = GAME_SESSION_ID) => {
                 io.to('admin_room').emit('session_reset', { gameSessionId });
                 io.to(SESSION_ROOM).emit('session_reset', { gameSessionId });
                 console.log('\u2705 Emitted session_reset to admin_room and session_main');
+                // Also emit a fresh empty lobby snapshot so UIs reset participant counts
+                io.to('admin_room').emit('lobby_update', { participants: [], count: 0 });
+                io.to(SESSION_ROOM).emit('lobby_update', { participants: [], count: 0 });
             } catch (e) {
                 console.error('Error emitting session_reset:', e);
             }
